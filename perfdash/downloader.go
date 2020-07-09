@@ -17,157 +17,283 @@ limitations under the License.
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"io/ioutil"
 	"k8s.io/klog"
-	"net/http"
+	"path"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 
+	"cloud.google.com/go/storage"
+	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 	"k8s.io/kubernetes/test/e2e/perftype"
 )
 
-// Downloader is the interface that gets a data from a predefined source.
-type Downloader interface {
-	getData() (MetricToBuildData, error)
+// DownloaderOptions is an options for Downloader.
+type DownloaderOptions struct {
+	ConfigPaths        []string
+	GithubConfigDirs   []string
+	DefaultBuildsCount int
+	LogsBucket         string
+	LogsPath           string
+	CredentialPath     string
+	// Development-only flag.
+	// Overrides build count from "perfDashBuildsCount" label with DefaultBuildsCount.
+	OverrideBuildCount bool
 }
 
-// BuildData contains job name and a map from build number to perf data.
-type BuildData struct {
-	Builds  map[string][]perftype.DataItem `json:"builds"`
-	Job     string                         `json:"job"`
-	Version string                         `json:"version"`
+// Downloader that gets data about Google results from the GCS repository.
+type Downloader struct {
+	BucketUtils BucketUtil
+	Options     *DownloaderOptions
 }
 
-// MetricToBuildData is a map from metric name to BuildData pointer.
-// TODO(random-liu): Use a more complex data structure if we need to support more test in the future.
-type MetricToBuildData map[string]*BuildData
-
-// CategoryToMetricData is a map from category name to MetricToBuildData.
-type CategoryToMetricData map[string]MetricToBuildData
-
-// JobToCategoryData is a map from job name to CategoryToMetricData.
-type JobToCategoryData map[string]CategoryToMetricData
-
-func serveHTTPObject(res http.ResponseWriter, req *http.Request, obj interface{}) {
-	data, err := json.Marshal(obj)
+// NewDownloader creates a new Downloader.
+func NewDownloader(opt *DownloaderOptions) (*Downloader, error) {
+	b, err := newBucketUtil(opt.LogsBucket, opt.LogsPath, opt.CredentialPath)
 	if err != nil {
-		res.Header().Set("Content-type", "text/html")
-		res.WriteHeader(http.StatusInternalServerError)
-		res.Write([]byte(fmt.Sprintf("<h3>Internal Error</h3><p>%v", err)))
-		return
+		return nil, err
 	}
-	res.Header().Set("Content-type", "application/json")
-	res.WriteHeader(http.StatusOK)
-	res.Write(data)
+	return &Downloader{
+		BucketUtils: b,
+		Options:     opt,
+	}, nil
 }
 
-func getURLParam(req *http.Request, name string) (string, bool) {
-	params, ok := req.URL.Query()[name]
-	if !ok || len(params) < 1 {
-		return "", false
+// TODO(random-liu): Only download and update new data each time.
+func (g *Downloader) getData() (JobToCategoryData, error) {
+	configPaths := make([]string, len(g.Options.ConfigPaths))
+	copy(configPaths, g.Options.ConfigPaths)
+	for _, githubURL := range g.Options.GithubConfigDirs {
+		githubConfigPaths, err := GetConfigsFromGithub(githubURL)
+		if err != nil {
+			return nil, err
+		}
+		configPaths = append(configPaths, githubConfigPaths...)
 	}
-	return params[0], true
+
+	klog.Infof("Config paths - %d", len(configPaths))
+	for i, configPath := range configPaths {
+		klog.Infof("Config path %d: %s", i+1, configPath)
+	}
+
+	newJobs, err := getProwConfig(configPaths)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh config: %v", err)
+	}
+	klog.Infof("Getting Data from GCS...")
+	result := make(JobToCategoryData)
+	var resultLock sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(len(newJobs))
+	for job, tests := range newJobs {
+		if tests.Prefix == "" {
+			return nil, fmt.Errorf("Invalid empty Prefix for job %s", job)
+		}
+		go g.getJobData(&wg, result, &resultLock, job, tests)
+	}
+	wg.Wait()
+	return result, nil
 }
 
-// ServeJobNames serves all available job names.
-func (j *JobToCategoryData) ServeJobNames(res http.ResponseWriter, req *http.Request) {
-	jobNames := make([]string, 0)
-	if j != nil {
-		for k := range *j {
-			jobNames = append(jobNames, k)
+/*
+getJobData fetches build numbers, reads metrics data from GCS and
+updates result with parsed metrics for a given prow job. Assumptions:
+- metric files are in /artifacts directory
+- metric file names have following prefix: {{OutputFilePrefix}}_{{Name}},
+  where OutputFilePrefix and Name are parts of test description (specified in prefdash config)
+- if there are multiple files with a given prefix, then expected format is
+  {{OutputFilePrefix}}_{{Name}}_{{SuiteId}}. SuiteId is prepended to the category label,
+  which allows comparing metrics across several runs in a given suite
+*/
+func (g *Downloader) getJobData(wg *sync.WaitGroup, result JobToCategoryData, resultLock *sync.Mutex, job string, tests Tests) {
+	defer wg.Done()
+	buildNumbers, err := g.BucketUtils.getBuildNumbersFromBucket(job)
+	if err != nil {
+		panic(err)
+	}
+
+	buildsToFetch := tests.BuildsCount
+	if buildsToFetch < 1 || g.Options.OverrideBuildCount {
+		buildsToFetch = g.Options.DefaultBuildsCount
+	}
+	klog.Infof("Builds to fetch for %v: %v", job, buildsToFetch)
+
+	sort.Sort(sort.Reverse(sort.IntSlice(buildNumbers)))
+	for index := 0; index < buildsToFetch && index < len(buildNumbers); index++ {
+		buildNumber := buildNumbers[index]
+		klog.Infof("Fetching %s build %v...", job, buildNumber)
+		for categoryLabel, categoryMap := range tests.Descriptions {
+			for testLabel, testDescriptions := range categoryMap {
+				for _, testDescription := range testDescriptions {
+					filePrefix := fmt.Sprintf("%v_%v", testDescription.OutputFilePrefix, testDescription.Name)
+					searchPrefix := fmt.Sprintf("artifacts/%v", filePrefix)
+					artifacts, err := g.BucketUtils.listFilesInBuild(job, buildNumber, searchPrefix)
+					if err != nil || len(artifacts) == 0 {
+						klog.Errorf("Error while looking for %s* in %s build %v: %v", searchPrefix, job, buildNumber, err)
+						continue
+					}
+					for _, artifact := range artifacts {
+						metricsFileName := filepath.Base(artifact)
+						resultCategory := getResultCategory(metricsFileName, filePrefix, categoryLabel, artifacts)
+						testDataResponse, err := g.BucketUtils.getFileFromBucket(job, buildNumber,
+							fmt.Sprintf("artifacts/%v", metricsFileName))
+						if err != nil {
+							klog.Errorf("Error when reading response Body: %v", err)
+							continue
+						}
+						buildData := getBuildData(result, tests.Prefix, resultCategory, testLabel, job, resultLock)
+						testDescription.Parser(testDataResponse, buildNumber, buildData)
+					}
+					break
+				}
+			}
 		}
 	}
-	sort.Strings(jobNames)
-	serveHTTPObject(res, req, &jobNames)
 }
 
-// ServeCategoryNames serves all available category names for given job.
-func (j *JobToCategoryData) ServeCategoryNames(res http.ResponseWriter, req *http.Request) {
-	jobname, ok := getURLParam(req, "jobname")
-	if !ok {
-		klog.Warningf("Url Param 'jobname' is missing")
-		return
+func getResultCategory(metricsFileName string, filePrefix string, category string, artifacts []string) string {
+	if len(artifacts) <= 1 {
+		return category
 	}
-
-	tests, ok := (*j)[jobname]
-	if !ok {
-		klog.Infof("unknown jobname - %v", jobname)
-		return
-	}
-
-	categorynames := make([]string, 0)
-	for k := range tests {
-		categorynames = append(categorynames, k)
-	}
-	sort.Strings(categorynames)
-	serveHTTPObject(res, req, &categorynames)
+	// If there are more artifacts, assume that this is a test suite run.
+	trimmed := strings.TrimPrefix(metricsFileName, filePrefix+"_")
+	suiteID := strings.Split(trimmed, "_")[0]
+	return fmt.Sprintf("%v_%v", suiteID, category)
 }
 
-// ServeMetricNames serves all available metric names for given job and category.
-func (j *JobToCategoryData) ServeMetricNames(res http.ResponseWriter, req *http.Request) {
-	jobname, ok := getURLParam(req, "jobname")
-	if !ok {
-		klog.Warningf("Url Param 'jobname' is missing")
-		return
+func getBuildData(result JobToCategoryData, prefix string, category string, label string, job string, resultLock *sync.Mutex) *BuildData {
+	resultLock.Lock()
+	defer resultLock.Unlock()
+	if _, found := result[prefix]; !found {
+		result[prefix] = make(CategoryToMetricData)
 	}
-	categoryname, ok := getURLParam(req, "metriccategoryname")
-	if !ok {
-		klog.Warningf("Url Param 'metriccategoryname' is missing")
-		return
+	if _, found := result[prefix][category]; !found {
+		result[prefix][category] = make(MetricToBuildData)
 	}
-
-	categories, ok := (*j)[jobname]
-	if !ok {
-		klog.Infof("unknown jobname - %v", jobname)
-		return
+	if _, found := result[prefix][category][label]; !found {
+		result[prefix][category][label] = &BuildData{Job: job, Version: "", Builds: map[string][]perftype.DataItem{}}
 	}
-	tests, ok := categories[categoryname]
-	if !ok {
-		klog.Infof("unknown metriccategoryname - %v", categoryname)
-		return
-	}
-
-	metricnames := make([]string, 0)
-	for k := range tests {
-		metricnames = append(metricnames, k)
-	}
-	sort.Strings(metricnames)
-	serveHTTPObject(res, req, &metricnames)
+	return result[prefix][category][label]
 }
 
-// ServeBuildsData serves builds data for given job name, category name and test name.
-func (j *JobToCategoryData) ServeBuildsData(res http.ResponseWriter, req *http.Request) {
-	jobname, ok := getURLParam(req, "jobname")
-	if !ok {
-		klog.Warningf("Url Param 'jobname' is missing")
-		return
-	}
-	categoryname, ok := getURLParam(req, "metriccategoryname")
-	if !ok {
-		klog.Warningf("Url Param 'metriccategoryname' is missing")
-		return
-	}
-	metricname, ok := getURLParam(req, "metricname")
-	if !ok {
-		klog.Warningf("Url Param 'metricname' is missing")
-		return
-	}
+// BucketUtil is the interface that fetches data from a storage service
+type BucketUtil interface {
+	getBuildNumbersFromBucket(job string) ([]int, error)
+	listFilesInBuild(job string, buildNumber int, prefix string) ([]string, error)
+	getFileFromBucket(job string, buildNumber int, path string) ([]byte, error)
+}
 
-	categories, ok := (*j)[jobname]
-	if !ok {
-		klog.Infof("unknown jobname - %v", jobname)
-		return
-	}
-	tests, ok := categories[categoryname]
-	if !ok {
-		klog.Infof("unknown metriccategoryname - %v", categoryname)
-		return
-	}
-	builds, ok := tests[metricname]
-	if !ok {
-		klog.Infof("unknown metricname - %v", metricname)
-		return
-	}
+// GCSBucketUtil that creates a Google Cloud Storage client to fetch data
+type GCSBucketUtil struct {
+	client  *storage.Client
+	bucket  *storage.BucketHandle
+	logPath string
+}
 
-	serveHTTPObject(res, req, builds)
+func newBucketUtil(bucket, path, credentialPath string) (BucketUtil, error) {
+	ctx := context.Background()
+	authOpt := option.WithoutAuthentication()
+	if credentialPath != "" {
+		authOpt = option.WithCredentialsFile(credentialPath)
+	}
+	c, err := storage.NewClient(ctx, authOpt)
+	if err != nil {
+		return nil, err
+	}
+	b := c.Bucket(bucket)
+	return &GCSBucketUtil{
+		client:  c,
+		bucket:  b,
+		logPath: path,
+	}, nil
+}
+
+// GoogleGCS functions for GCSBucketUtil
+func (b *GCSBucketUtil) getBuildNumbersFromBucket(job string) ([]int, error) {
+	var builds []int
+	ctx := context.Background()
+	jobPrefix := joinStringsAndInts(b.logPath, job) + "/"
+	klog.Infof("%s", jobPrefix)
+	it := b.bucket.Objects(ctx, &storage.Query{
+		Prefix:    jobPrefix,
+		Delimiter: "/",
+	})
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if attrs.Prefix == "" {
+			continue
+		}
+		build := strings.TrimPrefix(attrs.Prefix, jobPrefix)
+		build = strings.TrimSuffix(build, "/")
+		buildNo, err := strconv.Atoi(build)
+		if err != nil {
+			return nil, fmt.Errorf("unknown build name convention: %s", build)
+		}
+		builds = append(builds, buildNo)
+	}
+	return builds, nil
+}
+
+func (b *GCSBucketUtil) listFilesInBuild(job string, buildNumber int, prefix string) ([]string, error) {
+	var files []string
+	ctx := context.Background()
+	jobPrefix := joinStringsAndInts(b.logPath, job, buildNumber, prefix)
+	it := b.bucket.Objects(ctx, &storage.Query{
+		Prefix: jobPrefix,
+	})
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		files = append(files, attrs.Name)
+	}
+	return files, nil
+}
+
+func (b *GCSBucketUtil) getFileFromBucket(job string, buildNumber int, path string) ([]byte, error) {
+	ctx := context.Background()
+	filePath := joinStringsAndInts(b.logPath, job, buildNumber, path)
+	rc, err := b.bucket.Object(filePath).NewReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	data, err := ioutil.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func joinStringsAndInts(pathElements ...interface{}) string {
+	var parts []string
+	for _, e := range pathElements {
+		switch t := e.(type) {
+		case string:
+			parts = append(parts, t)
+		case int:
+			parts = append(parts, strconv.Itoa(t))
+		default:
+			panic(fmt.Sprintf("joinStringsAndInts only accepts ints and strings as path elements, but was passed %#v", t))
+		}
+	}
+	return path.Join(parts...)
 }

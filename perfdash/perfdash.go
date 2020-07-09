@@ -33,7 +33,7 @@ const (
 	maxBuilds    = 100
 )
 
-var options = &GoogleGCSDownloaderOptions{}
+var options = &DownloaderOptions{}
 
 var (
 	addr   = pflag.String("address", ":8080", "The address to serve web data on")
@@ -76,7 +76,7 @@ func run() error {
 		options.DefaultBuildsCount = maxBuilds
 	}
 
-	downloader, err := NewGoogleGCSDownloader(options)
+	downloader, err := NewDownloader(options)
 	if err != nil {
 		panic(err)
 	}
